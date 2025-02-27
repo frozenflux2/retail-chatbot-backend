@@ -225,24 +225,24 @@ def chat_with_gpt4o(prompt, conversation_history=None):
        - Example: WHERE LOWER(REPLACE(REPLACE(REPLACE(city, '-', ''), '.', ''), ',', '')) LIKE LOWER('%tokyo%')
     
     4. bed_rooms (TEXT):
-       - Contains number of bedrooms as text (e.g., "1", "2", "3")
+       - Contains number of bedrooms as text (e.g., "1", "2", "3", "1.0")
        - For exact matching: WHERE bed_rooms = '2'
-       - For range queries: WHERE CAST(bed_rooms AS INTEGER) >= 2
+       - For range queries: WHERE CAST(REPLACE(bed_rooms, '.0', '') AS INTEGER) >= 2
     
     5. floors (TEXT):
-       - Contains floor number as text (e.g., "1", "2", "10")
+       - Contains floor number as text (e.g., "1", "2", "10", "3.0")
        - For exact matching: WHERE floors = '3'
-       - For range queries: WHERE CAST(floors AS INTEGER) >= 5
+       - For range queries: WHERE CAST(REPLACE(floors, '.0', '') AS INTEGER) >= 5
     
     6. age (TEXT):
-       - Contains building age in years as text (e.g., "5", "10", "20")
+       - Contains building age in years as text (e.g., "5", "10", "20", "5.0")
        - For exact matching: WHERE age = '5'
-       - For range queries: WHERE CAST(age AS INTEGER) <= 10
+       - For range queries: WHERE CAST(REPLACE(age, '.0', '') AS INTEGER) <= 10
     
     7. rent_amount (TEXT):
        - Contains monthly rent amount as text (e.g., "100000", "150000")
        - For exact matching: WHERE rent_amount = '100000'
-       - For range queries: WHERE CAST(rent_amount AS INTEGER) BETWEEN 100000 AND 200000
+       - For range queries: WHERE CAST(REPLACE(rent_amount, '.0', '') AS INTEGER) BETWEEN 100000 AND 200000
     
     VECTOR SEARCH CAPABILITY:
     - The system can also perform semantic vector search on the description field
