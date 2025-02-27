@@ -210,18 +210,19 @@ def chat_with_gpt4o(prompt, conversation_history=None):
     1. street (TEXT):
        - Contains street name in English
        - Use LOWER() and LIKE with wildcards for partial matching
-       - Example: WHERE LOWER(street) LIKE LOWER('%roppongi%')
+       - Remove special characters (hyphens, dots, commas) when searching
+       - Example: WHERE LOWER(REPLACE(REPLACE(REPLACE(street, '-', ''), '.', ''), ',', '')) LIKE LOWER('%roppongi%')
     
     2. ward (TEXT):
        - Contains Tokyo ward name (e.g., "Minato-ku", "Shibuya-ku")
        - Common wards: Minato-ku, Shibuya-ku, Shinjuku-ku, Setagaya-ku, Meguro-ku
-       - Use LOWER() and LIKE with wildcards for partial matching
-       - Example: WHERE LOWER(ward) LIKE LOWER('%minato%')
+       - Remove special characters (hyphens, dots, commas) when searching
+       - Example: WHERE LOWER(REPLACE(REPLACE(REPLACE(ward, '-', ''), '.', ''), ',', '')) LIKE LOWER('%minato%')
     
     3. city (TEXT):
        - Contains city name, usually "Tokyo"
-       - Use LOWER() and LIKE with wildcards for partial matching
-       - Example: WHERE LOWER(city) LIKE LOWER('%tokyo%')
+       - Remove special characters (hyphens, dots, commas) when searching
+       - Example: WHERE LOWER(REPLACE(REPLACE(REPLACE(city, '-', ''), '.', ''), ',', '')) LIKE LOWER('%tokyo%')
     
     4. bed_rooms (TEXT):
        - Contains number of bedrooms as text (e.g., "1", "2", "3")

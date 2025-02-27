@@ -153,7 +153,8 @@ def create_properties_table(conn):
 def fetch_data_from_csv():
     """Fetch data from CSV file."""
     try:
-        df = pd.read_csv(CSV_FILE_PATH)
+        # Add low_memory=False to handle mixed data types
+        df = pd.read_csv(CSV_FILE_PATH, low_memory=False)
         print(f"Successfully loaded {len(df)} rows from CSV file")
         return df
     except Exception as e:
@@ -164,6 +165,13 @@ def clean_data(df):
     """Clean and prepare data for database insertion."""
     # Create a copy to avoid modifying the original dataframe
     df_clean = df.copy()
+    
+    # Pre-create all new columns at once to avoid fragmentation
+    if 'address' in df_clean.columns and 'street' not in df_clean.columns:
+        # Create all new columns at once using a dictionary
+        new_cols = {'street': None, 'ward': None, 'city': None}
+        for col, default in new_cols.items():
+            df_clean[col] = default
     
     # Convert all numeric columns to string to avoid type issues
     for col in df_clean.columns:
@@ -190,6 +198,69 @@ def clean_data(df):
             df_clean[col] = pd.to_datetime(df_clean[col], errors='coerce')
             # Replace NaT with None
             df_clean[col] = df_clean[col].apply(lambda x: None if pd.isna(x) else x)
+    
+    # Extract only the numeric part from floors field
+    if 'floors' in df_clean.columns:
+        floor_pattern = r'(\d+)'
+        for idx, floors in df_clean['floors'].items():
+            if pd.isna(floors) or floors is None:
+                continue
+                
+            match = re.search(floor_pattern, str(floors))
+            if match:
+                df_clean.at[idx, 'floors'] = match.group(1)  # Extract just the number
+    
+    # Split address into components
+    if 'address' in df_clean.columns:
+        # Process each address
+        for idx, address in df_clean['address'].items():
+            if pd.isna(address) or address is None:
+                continue
+                
+            # Split by commas and clean up whitespace
+            parts = [p.strip() for p in address.split(',')]
+            
+            # Check if address is in reverse order (Tokyo, Shibuya, Higashi 4-7-4)
+            is_reverse_order = False
+            if len(parts) >= 3:
+                # Check if the first part is likely a city (Tokyo, Osaka, etc.)
+                common_cities = ['Tokyo', 'Osaka', 'Yokohama', 'Nagoya', 'Sapporo', 'Fukuoka', 'Kyoto']
+                if any(city.lower() in parts[0].lower() for city in common_cities):
+                    is_reverse_order = True
+            
+            # Handle different address formats
+            if is_reverse_order and len(parts) >= 3:
+                # Format: "Tokyo, Shibuya, Higashi 4-7-4"
+                df_clean.at[idx, 'city'] = parts[0]
+                df_clean.at[idx, 'ward'] = parts[1]
+                # If there are more parts, combine them as the street
+                if len(parts) > 3:
+                    df_clean.at[idx, 'street'] = ', '.join(parts[2:])
+                else:
+                    df_clean.at[idx, 'street'] = parts[2]
+            elif len(parts) >= 4:  # Format: "7-14, Shirogane 1-chome, Minato-ku, Tokyo"
+                # Combine the first two parts as the street address
+                df_clean.at[idx, 'street'] = f"{parts[0]}, {parts[1]}"
+                df_clean.at[idx, 'ward'] = parts[2]
+                df_clean.at[idx, 'city'] = parts[3]
+            elif len(parts) == 3:  # Format: "8-12-1 Machiya, Arakawa-ku, Tokyo"
+                df_clean.at[idx, 'street'] = parts[0]
+                df_clean.at[idx, 'ward'] = parts[1]
+                df_clean.at[idx, 'city'] = parts[2]
+            elif len(parts) == 2:  # Missing city
+                df_clean.at[idx, 'street'] = parts[0]
+                df_clean.at[idx, 'ward'] = parts[1]
+            elif len(parts) == 1:  # Only street
+                df_clean.at[idx, 'street'] = parts[0]
+    
+    # Convert text fields to lowercase and remove special characters
+    text_fields = ['street', 'ward', 'city', 'name', 'address', 'slug']
+    for field in text_fields:
+        if field in df_clean.columns:
+            # Convert to lowercase and remove special characters
+            df_clean[field] = df_clean[field].apply(
+                lambda x: re.sub(r'[^\w\s]', '', str(x).lower()) if not pd.isna(x) and x is not None else x
+            )
     
     print("Data cleaned and prepared for database insertion")
     return df_clean
@@ -321,7 +392,7 @@ def generate_and_store_embeddings(conn):
         print(f"Generating embeddings for {len(properties)} properties using parallel processing...")
         
         # Process properties in batches to avoid overwhelming the system
-        batch_size = 20
+        batch_size = 100
         total_processed = 0
         
         # Create batches
