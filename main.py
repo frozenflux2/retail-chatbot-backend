@@ -2,10 +2,11 @@ import os
 from openai import OpenAI
 from dotenv import load_dotenv
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import json
+import numpy as np
 
 # Load environment variables from .env file (for API keys and DB credentials)
 load_dotenv()
@@ -18,6 +19,20 @@ class AtHearthResponse(BaseModel):
     response: str
     generate_sql: bool
     sql_query: Optional[str] = None
+    vector_search: Optional[bool] = None
+    vector_search_criteria: Optional[str] = None
+
+def get_embedding(text):
+    """Get embedding vector for text using OpenAI's embedding model"""
+    try:
+        response = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        print(f"Error getting embedding: {e}")
+        return None
 
 def execute_sql_query(query):
     """Execute SQL query on PostgreSQL database and return results"""
@@ -44,6 +59,73 @@ def execute_sql_query(query):
     
     except Exception as e:
         return None, f"Database error: {str(e)}"
+
+def perform_vector_search(sql_results, search_criteria, limit=5):
+    """Perform vector search on the description field of properties"""
+    try:
+        # Get embedding for search criteria
+        search_embedding = get_embedding(search_criteria)
+        if not search_embedding:
+            return sql_results, "Failed to generate embedding for vector search"
+        
+        # Connect to PostgreSQL database
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            database=os.getenv("DB_NAME", "athearth"),
+            user=os.getenv("DB_USER", "postgres"),
+            password=os.getenv("DB_PASSWORD", ""),
+            port=os.getenv("DB_PORT", "5432")
+        )
+        
+        # If we have SQL results, get their IDs for filtering
+        property_ids = []
+        if sql_results:
+            property_ids = [result.get('id') for result in sql_results if result.get('id')]
+        
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            # Check if description_embedding column exists
+            cursor.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name='properties' AND column_name='description_embedding'
+            """)
+            has_embedding_column = cursor.fetchone() is not None
+            
+            if not has_embedding_column:
+                return sql_results, "Vector search not available: description_embedding column not found"
+            
+            # Convert the embedding to a PostgreSQL vector format - using the correct format with brackets
+            embedding_str = "[" + ",".join(str(x) for x in search_embedding) + "]"
+            
+            # Construct the vector search query
+            if property_ids:
+                # If we have SQL results, filter vector search to only those properties
+                query = """
+                    SELECT *, (description_embedding <=> %s::vector) AS similarity
+                    FROM properties
+                    WHERE id = ANY(%s)
+                    ORDER BY similarity
+                    LIMIT %s
+                """
+                cursor.execute(query, (embedding_str, property_ids, limit))
+            else:
+                # Otherwise, search all properties
+                query = """
+                    SELECT *, (description_embedding <=> %s::vector) AS similarity
+                    FROM properties
+                    ORDER BY similarity
+                    LIMIT %s
+                """
+                cursor.execute(query, (embedding_str, limit))
+            
+            vector_results = cursor.fetchall()
+            vector_results_list = [dict(row) for row in vector_results]
+        
+        conn.close()
+        return vector_results_list, None
+    
+    except Exception as e:
+        return sql_results, f"Vector search error: {str(e)}"
 
 def chat_with_gpt4o(prompt, conversation_history=None):
     if conversation_history is None:
@@ -118,7 +200,8 @@ def chat_with_gpt4o(prompt, conversation_history=None):
         facing_side_ja TEXT,
         source_link TEXT,
         created_at TIMESTAMP,
-        updated_at TIMESTAMP
+        updated_at TIMESTAMP,
+        description_embedding VECTOR(1536)
     );
     ```
     
@@ -160,6 +243,11 @@ def chat_with_gpt4o(prompt, conversation_history=None):
        - For exact matching: WHERE rent_amount = '100000'
        - For range queries: WHERE CAST(rent_amount AS INTEGER) BETWEEN 100000 AND 200000
     
+    VECTOR SEARCH CAPABILITY:
+    - The system can also perform semantic vector search on the description field
+    - This is useful for subjective criteria that can't be expressed in SQL
+    - Examples: "modern interior", "quiet neighborhood", "close to parks", "family-friendly"
+    
     Be helpful, informative, and guide users through the Tokyo rental process.
     
     If the user asks for data that would require a database query:
@@ -170,7 +258,13 @@ def chat_with_gpt4o(prompt, conversation_history=None):
     5. Always use CAST() for numeric comparisons since fields are stored as TEXT
     6. Limit results to 10 by default to avoid overwhelming responses
     
-    Otherwise, set generate_sql to false and leave sql_query empty."""
+    If the user has subjective criteria that can't be expressed in SQL:
+    1. Set vector_search to true
+    2. In vector_search_criteria, provide a clear, concise description of the subjective criteria
+    3. Keep vector_search_criteria focused on aspects that would appear in property descriptions
+    4. Example: "Modern apartment with natural lighting and close to green spaces"
+    
+    Otherwise, set generate_sql and vector_search to false and leave their respective fields empty."""
     
     try:
         # Make API call to OpenAI with structured output format
@@ -188,47 +282,80 @@ def chat_with_gpt4o(prompt, conversation_history=None):
         # Extract the structured response
         structured_response = completion.choices[0].message.parsed
         
+        # Initialize variables for search results
+        sql_results = None
+        vector_results = None
+        error_message = None
+        
         # If SQL query is generated, execute it and get results
         if structured_response.generate_sql and structured_response.sql_query:
-            results, error = execute_sql_query(structured_response.sql_query)
-            
+            sql_results, error = execute_sql_query(structured_response.sql_query)
             if error:
-                # If there's an error, update the response
-                structured_response.response += f"\n\nI tried to query our database, but encountered an error: {error}"
-            elif results is not None:
-                # If we have results, generate a new response based on them
-                result_prompt = f"""
-                I executed the following SQL query:
-                {structured_response.sql_query}
-                
-                And got these results:
-                {json.dumps(results, default=str)}
-                
-                Based on these actual database results, please provide a comprehensive and accurate response to the user's query:
-                "{prompt}"
-                
-                Include specific details from the results where relevant.
-                """
-                
-                # Get a new response based on the query results
-                result_completion = client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {"role": "system", "content": "You are AtHearth's AI rental assistant. Provide accurate information based on the database results."},
-                        {"role": "user", "content": result_prompt}
-                    ],
-                    temperature=0.7,
-                    max_tokens=1000
-                )
-                
-                # Update the response with the result-based answer
-                structured_response.response = result_completion.choices[0].message.content
+                error_message = f"SQL query error: {error}"
+        
+        # If vector search is requested, perform it
+        if structured_response.vector_search and structured_response.vector_search_criteria:
+            # If we have SQL results, use them as a filter for vector search
+            # Otherwise, vector search will be performed on all properties
+            vector_results, vector_error = perform_vector_search(
+                sql_results, 
+                structured_response.vector_search_criteria
+            )
+            
+            if vector_error:
+                if error_message:
+                    error_message += f"\nVector search error: {vector_error}"
+                else:
+                    error_message = f"Vector search error: {vector_error}"
+            
+            # Use vector results if available, otherwise fall back to SQL results
+            final_results = vector_results if vector_results else sql_results
+        else:
+            # If no vector search, use SQL results
+            final_results = sql_results
+        
+        # If we have an error but no results, update the response
+        if error_message and not final_results:
+            structured_response.response += f"\n\nI tried to query our database, but encountered errors: {error_message}"
+        
+        # If we have results, generate a new response based on them
+        elif final_results is not None:
+            result_prompt = f"""
+            I searched for properties based on the user's criteria.
+            
+            SQL Query: {structured_response.sql_query if structured_response.generate_sql else "Not used"}
+            
+            Vector Search Criteria: {structured_response.vector_search_criteria if structured_response.vector_search else "Not used"}
+            
+            Search Results:
+            {json.dumps(final_results, default=str)}
+            
+            Based on these search results, please provide a comprehensive and accurate response to the user's query:
+            "{prompt}"
+            
+            Include specific details from the results where relevant.
+            """
+            
+            # Get a new response based on the search results
+            result_completion = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are AtHearth's AI rental assistant. Provide accurate information based on the search results."},
+                    {"role": "user", "content": result_prompt}
+                ],
+                temperature=0.7,
+                max_tokens=1000
+            )
+            
+            # Update the response with the result-based answer
+            structured_response.response = result_completion.choices[0].message.content
         
         # Add the assistant's response to the conversation history (as string for history)
         response_for_history = {
             "role": "assistant", 
             "content": f"Response: {structured_response.response}" + 
-                      (f"\nSQL Query: {structured_response.sql_query}" if structured_response.generate_sql else "")
+                      (f"\nSQL Query: {structured_response.sql_query}" if structured_response.generate_sql else "") +
+                      (f"\nVector Search: {structured_response.vector_search_criteria}" if structured_response.vector_search else "")
         }
         conversation_history.append(response_for_history)
         
@@ -237,7 +364,8 @@ def chat_with_gpt4o(prompt, conversation_history=None):
     except Exception as e:
         error_response = AtHearthResponse(
             response=f"An error occurred: {str(e)}",
-            generate_sql=False
+            generate_sql=False,
+            vector_search=False
         )
         return error_response, conversation_history
 
@@ -264,6 +392,11 @@ def main():
         if response_data.generate_sql and response_data.sql_query:
             print("\nGenerated SQL Query:")
             print(response_data.sql_query)
+            
+        # If vector search was used, display the criteria
+        if response_data.vector_search and response_data.vector_search_criteria:
+            print("\nVector Search Criteria:")
+            print(response_data.vector_search_criteria)
 
 if __name__ == "__main__":
     main()
